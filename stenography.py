@@ -1,117 +1,171 @@
 from PIL import Image
 from bitarray import bitarray
-from bitarray.util import ba2int
+from bitarray.util import ba2int, int2ba
+from pathlib import Path
+import io
+import secrets
+import random
+import os
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-file = 'grizzly_bear.png'
-secret = "I AM A GRIZZLY BEAR RRRR BROWN BEAR BROWN BEAR"
+MAX_SEED_BITS = 16
+MAX_SIZE_BITS = 17
 
-MAX_SIZE_BITS = 16
+def encrypt(password: bytes, plaintext: bytes):
+    # 1. derive aes key from password with random salt
+    salt = os.urandom(16)
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=16,
+        salt=salt,
+        iterations=1_000_000)
+    key = kdf.derive(password)
 
-def binary(x):
-    return format(x, '08b')
+    # 2. create IV for aes (128 bits)
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES128(key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
 
-def enscribe(f, s):
-    s = s.encode('utf8')
-    s_bits = bitarray(''.join([binary(c) for c in s]))
+    # 3. return salt, iv, ciphertext
+    return salt, iv, ciphertext 
 
-    s_size_bits = bitarray(MAX_SIZE_BITS)
-    s_size_bits_val = bitarray(binary(len(s_size_bits) + len(s_bits))) # size of entire payload (including itself)
-    s_size_bits[-len(s_size_bits_val):] = s_size_bits_val
+def decrypt(password: bytes, salt: bytes, ciphertext: bytes, iv: bytes):
+    # 1. derive aes key from password and salt 
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=16,
+        salt=salt,
+        iterations=1_000_000)
+    key = kdf.derive(password)
 
-    total_msg_bits = s_size_bits + s_bits
-    total_msg_bits_len = len(total_msg_bits)
+    # 2. decrypt with aes
+    cipher = Cipher(algorithms.AES128(key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    plaintext = decryptor.update(bytes(ciphertext)) + decryptor.finalize()
+
+    return plaintext
+
+
+
+
+def enscribe(file, secret):
+    def binary(x):
+        return format(x, '08b')
+    secret = secret.encode('utf8')
+
+    secret_ba = bitarray(''.join([binary(c) for c in secret]))
+
+    # used to seed RNG for bit placement
+    seed_ba = bitarray(MAX_SEED_BITS)
+    seed = secrets.randbelow(2**MAX_SEED_BITS)
+    binary_seed = int2ba(seed) # set value
+    seed_ba[-len(binary_seed):] = binary_seed
+
+    size_ba = bitarray(MAX_SIZE_BITS)
+    # size = len(size_ba) + len(seed_ba) + len(secret_ba)
+    size = len(secret_ba)
+    binary_size = int2ba(size) # size of entire payload (including itself)
+    size_ba[-len(binary_size):] = binary_size
+
+    metadata_ba = size_ba + seed_ba
+
+    print(f"Seed: {seed} ({seed_ba})")
+    print(f"Size: {size} ({size_ba})")
+    print(f"Secret {secret} ({secret_ba})")
 
     # image
-    img = Image.open(f)
-    pixels = img.load()
-    width, height = img.size
+    image = Image.open(file)
+    width, height = image.size
+    pixels = image.load()
 
-    bit_idx = 0
-    pixel_idx = 0
-    while bit_idx < total_msg_bits_len:
-
+        
+    def write_to_loc(image, pixels, idx, b, log=False):
         def hide(n, b):
             if b == 0:
                 return n & (254) # last bit = 0
             else:
                 return n | (1) # last bit = 1
             
-        x = pixel_idx % width
-        y = pixel_idx // width
-        pixel_channels = img.getpixel((x, y))
+        total_bands = len(image.getbands())
+        width, _ = image.size
+        x = (idx // total_bands) % width
+        y = (idx // total_bands) // width
+        band = idx % 3
 
-        new_channel = list()
+        pixel = image.getpixel((x, y))
+        pixels[x, y] = tuple([x if i != band else hide(x, b) for i,x in enumerate(pixel)])
 
-        for channel_val in pixel_channels:
-            if bit_idx < total_msg_bits_len:
-                new_channel.append(hide(channel_val, total_msg_bits[bit_idx]))
-                bit_idx = bit_idx + 1
-            else:
-                new_channel.append(channel_val)
+    # write metadata
+    total_size = width * height * len(image.getbands())
 
-        pixels[x, y] = tuple(new_channel)
-        pixel_idx = pixel_idx + 1
-        
-    new_f = "MOD_" + f
-    img.save(new_f, format='png')
-    return new_f
-
-
-
-def discover(f):
-    img = Image.open(f)
-    width, height = img.size
+    print(total_size)
     
-    # read size
-    bit_idx = 0
-    pixel_idx = 0
+    for i, loc in enumerate(range(total_size - len(metadata_ba), total_size)):
+        write_to_loc(image, pixels, loc, metadata_ba[i], log=True)
 
-    payload_size = bitarray()
+    # write body
+    random.seed(seed)
 
-    while bit_idx < MAX_SIZE_BITS:        
-        x = pixel_idx % width
-        y = pixel_idx // width
-        pixel_channels = img.getpixel((x, y))
+    rand_locs = []
 
-        for channel_val in pixel_channels:
-            if bit_idx < MAX_SIZE_BITS:
-                payload_size.append(channel_val & 1)
-            else:
-                break
-            bit_idx = bit_idx + 1
-        
-        pixel_idx = pixel_idx + 1
+    for b in secret_ba:
+        loc = random.randrange(0, total_size - len(metadata_ba) - 1)
+        rand_locs.append(loc)
+        write_to_loc(image, pixels, loc, b)
 
-    payload_size = ba2int(payload_size)
+    print(rand_locs)
 
-    # REMOVE
+    # save the file
+    image.save('MOD_' + file, format='png')
 
-    # read payload
-    bit_idx = 0
-    pixel_idx = 0
+    return "MOD_" + file
 
-    payload = bitarray()
 
-    while bit_idx < payload_size:        
-        x = pixel_idx % width
-        y = pixel_idx // width
-        pixel_channels = img.getpixel((x, y))
+def discover(file):
+    image = Image.open(file)
+    width, height = image.size
 
-        for channel_val in pixel_channels:
-            if bit_idx < payload_size:
-                payload.append(channel_val & 1)
-            else:
-                break
-            bit_idx = bit_idx + 1
-        
-        pixel_idx = pixel_idx + 1
+    def read_from_loc(image, idx):
+        total_bands = len(image.getbands())
+        width, _ = image.size
+        x = (idx // total_bands) % width
+        y = (idx // total_bands) // width
+        band = idx % 3
+
+        return image.getpixel((x, y))[band] & 1
+
+    # read metadata
+    total_size = width * height * len(image.getbands())
+
+    metadata_ba = bitarray(MAX_SIZE_BITS + MAX_SEED_BITS)
     
-    payload_text_bits = payload[MAX_SIZE_BITS:]
-    payload_text = payload_text_bits.tobytes().decode("utf8")
+    for i, loc in enumerate(range(total_size - len(metadata_ba), total_size)):
+        metadata_ba[i] = read_from_loc(image, loc)
 
-    return payload_text
+    size = ba2int(metadata_ba[:MAX_SIZE_BITS])
+    seed = ba2int(metadata_ba[-MAX_SEED_BITS:])
 
+    # read body
+    random.seed(seed)
 
+    rand_locs = []
 
-enscribed_f = enscribe(file, secret)
-print(discover(enscribed_f))
+    payload_ba = bitarray(size)
+    for i in range(len(payload_ba)):
+        loc = random.randrange(0, total_size - len(metadata_ba) - 1)
+        rand_locs.append(loc)
+        payload_ba[i] = read_from_loc(image, loc)
+
+    try:
+        return payload_ba.tobytes().decode("utf8")
+    except:
+        return None
+    
+
+secret = "TEST"
+file = "grizzly_bear.png"
+new_f = enscribe(file, secret)
+print(discover(new_f))

@@ -16,13 +16,16 @@ from PySide6.QtGui import (
 from PySide6.QtCore import  QSize, Qt, QByteArray
 from PIL import Image
 from bitarray import bitarray
-from bitarray.util import ba2int
+from bitarray.util import ba2int, int2ba
 from pathlib import Path
 import io
+import secrets
+import random
 
 class Steganographer:
     def __init__(self):
         self.MAX_SIZE_BITS = 16
+        self.MAX_SEED_BITS = 16
         self.filepath : Path = None
         pass
 
@@ -34,108 +37,107 @@ class Steganographer:
             return format(x, '08b')
         secret = secret.encode('utf8')
 
-        s_bits = bitarray(''.join([binary(c) for c in secret]))
+        secret_ba = bitarray(''.join([binary(c) for c in secret]))
 
-        s_size_bits = bitarray(self.MAX_SIZE_BITS)
-        s_size_bits_val = bitarray(binary(len(s_size_bits) + len(s_bits))) # size of entire payload (including itself)
-        s_size_bits[-len(s_size_bits_val):] = s_size_bits_val
+        # used to seed RNG for bit placement
+        seed_ba = bitarray(self.MAX_SEED_BITS)
+        seed = secrets.randbelow(2**self.MAX_SEED_BITS)
+        binary_seed = int2ba(seed) # set value
+        seed_ba[-len(binary_seed):] = binary_seed
 
-        total_msg_bits = s_size_bits + s_bits
-        total_msg_bits_len = len(total_msg_bits)
+        size_ba = bitarray(self.MAX_SIZE_BITS)
+        # size = len(size_ba) + len(seed_ba) + len(secret_ba)
+        size = len(secret_ba)
+        binary_size = int2ba(size) # size of entire payload (including itself)
+        size_ba[-len(binary_size):] = binary_size
+
+        metadata_ba = size_ba + seed_ba
 
         # image
-        img = Image.open(file)
-        pixels = img.load()
-        width, height = img.size
+        image = Image.open(file)
+        width, height = image.size
+        pixels = image.load()
 
-        bit_idx = 0
-        pixel_idx = 0
-        while bit_idx < total_msg_bits_len:
-
+            
+        def write_to_loc(image, pixels, idx, b, log=False):
             def hide(n, b):
                 if b == 0:
                     return n & (254) # last bit = 0
                 else:
                     return n | (1) # last bit = 1
                 
-            x = pixel_idx % width
-            y = pixel_idx // width
-            pixel_channels = img.getpixel((x, y))
+            total_bands = len(image.getbands())
+            width, _ = image.size
+            x = (idx // total_bands) % width
+            y = (idx // total_bands) // width
+            band = idx % 3
 
-            new_channel = list()
+            pixel = image.getpixel((x, y))
+            pixels[x, y] = tuple([x if i != band else hide(x, b) for i,x in enumerate(pixel)])
 
-            for channel_val in pixel_channels:
-                if bit_idx < total_msg_bits_len:
-                    new_channel.append(hide(channel_val, total_msg_bits[bit_idx]))
-                    bit_idx = bit_idx + 1
-                else:
-                    new_channel.append(channel_val)
+        # write metadata
+        total_size = width * height * len(image.getbands())
+        
+        for i, loc in enumerate(range(total_size - len(metadata_ba), total_size)):
+            write_to_loc(image, pixels, loc, metadata_ba[i], log=True)
 
-            pixels[x, y] = tuple(new_channel)
-            pixel_idx = pixel_idx + 1
-            
+        # write body
+        random.seed(seed)
+
+        rand_locs = []
+
+        for b in secret_ba:
+            loc = random.randrange(0, total_size - len(metadata_ba) - 1)
+            rand_locs.append(loc)
+            write_to_loc(image, pixels, loc, b)
+
+        # save the file
         image_bytes = io.BytesIO()
-        img.save(image_bytes, format='png')
+        image.save(image_bytes, format='png')
+
         return image_bytes.getvalue()
-        # new_f = "MOD_" + file
-        # img.save(new_f, format='png')
-        # return new_f
     
+
     def discover(self, file):
-        img = Image.open(file)
-        width, height = img.size
+        image = Image.open(file)
+        width, height = image.size
+
+        def read_from_loc(image, idx):
+            total_bands = len(image.getbands())
+            width, _ = image.size
+            x = (idx // total_bands) % width
+            y = (idx // total_bands) // width
+            band = idx % 3
+
+            return image.getpixel((x, y))[band] & 1
+
+        # read metadata
+        total_size = width * height * len(image.getbands())
+
+        metadata_ba = bitarray(self.MAX_SIZE_BITS + self.MAX_SEED_BITS)
         
-        # read size
-        bit_idx = 0
-        pixel_idx = 0
+        for i, loc in enumerate(range(total_size - len(metadata_ba), total_size)):
+            metadata_ba[i] = read_from_loc(image, loc)
 
-        payload_size = bitarray()
+        size = ba2int(metadata_ba[:self.MAX_SIZE_BITS])
+        seed = ba2int(metadata_ba[-self.MAX_SEED_BITS:])
 
-        while bit_idx < self.MAX_SIZE_BITS:        
-            x = pixel_idx % width
-            y = pixel_idx // width
-            pixel_channels = img.getpixel((x, y))
+        # read body
+        random.seed(seed)
 
-            for channel_val in pixel_channels:
-                if bit_idx < self.MAX_SIZE_BITS:
-                    payload_size.append(channel_val & 1)
-                else:
-                    break
-                bit_idx = bit_idx + 1
-            
-            pixel_idx = pixel_idx + 1
+        rand_locs = []
 
-        payload_size = ba2int(payload_size)
+        payload_ba = bitarray(size)
+        for i in range(len(payload_ba)):
+            loc = random.randrange(0, total_size - len(metadata_ba) - 1)
+            rand_locs.append(loc)
+            payload_ba[i] = read_from_loc(image, loc)
 
-        # REMOVE
-
-        # read payload
-        bit_idx = 0
-        pixel_idx = 0
-
-        payload = bitarray()
-
-        while bit_idx < payload_size:        
-            x = pixel_idx % width
-            y = pixel_idx // width
-            pixel_channels = img.getpixel((x, y))
-
-            for channel_val in pixel_channels:
-                if bit_idx < payload_size:
-                    payload.append(channel_val & 1)
-                else:
-                    break
-                bit_idx = bit_idx + 1
-            
-            pixel_idx = pixel_idx + 1
-        
-        payload_text_bits = payload[self.MAX_SIZE_BITS:]
         try:
-            payload_text = payload_text_bits.tobytes().decode("utf8")
+            return payload_ba.tobytes().decode("utf8")
         except:
-            payload_text = None
-
-        return payload_text
+            return None
+        
 
 class MainWindow(QMainWindow):
     def __init__(self):
