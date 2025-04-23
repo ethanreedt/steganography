@@ -7,10 +7,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QPushButton,
     QWidget,
-    QFileDialog
+    QFileDialog,
+    QInputDialog
 )
 from PySide6.QtGui import (
-    QImage,
     QPixmap
 )
 from PySide6.QtCore import  QSize, Qt, QByteArray
@@ -21,18 +21,71 @@ from pathlib import Path
 import io
 import secrets
 import random
+import os
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hashes, padding
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 class Steganographer:
     def __init__(self):
         self.MAX_SIZE_BITS = 16
         self.MAX_SEED_BITS = 16
+        self.IV_BYTES = 16
+        self.SALT_BYTES = 16
+        self.BLOCK_SIZE_BITS = 128
         self.filepath : Path = None
         pass
 
     def set_file(self, filepath : Path):
         self.filepath = filepath
 
-    def enscribe(self, file, secret):
+    def encrypt(self, password: bytes, plaintext: bytes):
+        # 0. pad plaintext
+        padder = padding.PKCS7(self.BLOCK_SIZE_BITS).padder()
+        plaintext = padder.update(plaintext) + padder.finalize()
+
+        # 1. derive aes key from password with random salt
+        salt = os.urandom(16)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=16,
+            salt=salt,
+            iterations=1_000_000)
+        key = kdf.derive(password)
+
+        # 2. create IV for aes (128 bits)
+
+        iv = os.urandom(16)
+        cipher = Cipher(algorithms.AES128(key), modes.CBC(iv))
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+
+        # 3. return salt, iv, ciphertext
+        return salt, iv, ciphertext 
+
+    def decrypt(self, password: bytes, salt: bytes, ciphertext: bytes, iv: bytes):
+        # 1. derive aes key from password and salt 
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=16,
+            salt=salt,
+            iterations=1_000_000)
+        key = kdf.derive(password)
+
+        # 2. decrypt with aes
+        cipher = Cipher(algorithms.AES128(key), modes.CBC(iv))
+        decryptor = cipher.decryptor()
+        plaintext = decryptor.update(bytes(ciphertext)) + decryptor.finalize()
+
+        # 3. unpad plaintext
+        unpadder = padding.PKCS7(self.BLOCK_SIZE_BITS).unpadder()
+        plaintext = unpadder.update(plaintext) + unpadder.finalize()
+
+        return plaintext
+
+
+
+    def enscribe(self, file, secret, password):
         def binary(x):
             return format(x, '08b')
         secret = secret.encode('utf8')
@@ -52,6 +105,11 @@ class Steganographer:
         size_ba[-len(binary_size):] = binary_size
 
         metadata_ba = size_ba + seed_ba
+
+        salt, iv, ciphertext = self.encrypt(bytes(password, encoding='utf8'), metadata_ba.tobytes())
+
+        enc_metadata_ba = bitarray()
+        enc_metadata_ba.frombytes(ciphertext + iv + salt)
 
         # image
         image = Image.open(file)
@@ -78,8 +136,8 @@ class Steganographer:
         # write metadata
         total_size = width * height * len(image.getbands())
         
-        for i, loc in enumerate(range(total_size - len(metadata_ba), total_size)):
-            write_to_loc(image, pixels, loc, metadata_ba[i], log=True)
+        for i, loc in enumerate(range(total_size - len(enc_metadata_ba), total_size)):
+            write_to_loc(image, pixels, loc, enc_metadata_ba[i], log=True)
 
         # write body
         random.seed(seed)
@@ -87,18 +145,18 @@ class Steganographer:
         rand_locs = []
 
         for b in secret_ba:
-            loc = random.randrange(0, total_size - len(metadata_ba) - 1)
+            loc = random.randrange(0, total_size - len(enc_metadata_ba) - 1)
             rand_locs.append(loc)
             write_to_loc(image, pixels, loc, b)
-
+            
         # save the file
         image_bytes = io.BytesIO()
         image.save(image_bytes, format='png')
 
         return image_bytes.getvalue()
-    
 
-    def discover(self, file):
+
+    def discover(self, file, password):
         image = Image.open(file)
         width, height = image.size
 
@@ -114,13 +172,22 @@ class Steganographer:
         # read metadata
         total_size = width * height * len(image.getbands())
 
-        metadata_ba = bitarray(self.MAX_SIZE_BITS + self.MAX_SEED_BITS)
+        enc_metadata_ba = bitarray(self.BLOCK_SIZE_BITS + (self.IV_BYTES + self.SALT_BYTES) * 8)
         
-        for i, loc in enumerate(range(total_size - len(metadata_ba), total_size)):
-            metadata_ba[i] = read_from_loc(image, loc)
+        for i, loc in enumerate(range(total_size - len(enc_metadata_ba), total_size)):
+            enc_metadata_ba[i] = read_from_loc(image, loc)
+
+        ciphertext = enc_metadata_ba[:self.BLOCK_SIZE_BITS].tobytes()
+        iv = enc_metadata_ba[self.BLOCK_SIZE_BITS:self.BLOCK_SIZE_BITS + (self.IV_BYTES * 8)].tobytes()
+        salt = enc_metadata_ba[self.BLOCK_SIZE_BITS + (self.IV_BYTES * 8):].tobytes()
+        
+        plaintext = self.decrypt(bytes(password, encoding='utf8'), salt, ciphertext, iv)
+
+        metadata_ba = bitarray()
+        metadata_ba.frombytes(plaintext)
 
         size = ba2int(metadata_ba[:self.MAX_SIZE_BITS])
-        seed = ba2int(metadata_ba[-self.MAX_SEED_BITS:])
+        seed = ba2int(metadata_ba[self.MAX_SIZE_BITS:self.MAX_SIZE_BITS + self.MAX_SEED_BITS]) # ending will be padding up to block size 
 
         # read body
         random.seed(seed)
@@ -136,8 +203,7 @@ class Steganographer:
         try:
             return payload_ba.tobytes().decode("utf8")
         except:
-            return None
-        
+            return None        
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -190,12 +256,12 @@ class MainWindow(QMainWindow):
 
         self.layout = QHBoxLayout()
         self.layout.addLayout(self.left_layout)
-        # self.layout.addLayout(self.right_layout)
 
         container = QWidget()
         container.setLayout(self.layout)
 
         self.setCentralWidget(container)
+
     
     def search_images(self, s):
         filepath, _ = QFileDialog.getOpenFileName(self,
@@ -212,24 +278,36 @@ class MainWindow(QMainWindow):
         self.discover_button.setEnabled(True)
         self.filename.setText(filepath.name)
         self.image.setPixmap(QPixmap(filepath).scaled(400, 400, aspectMode=Qt.AspectRatioMode.KeepAspectRatio))
+        self.hidden_message.setText("")
 
     def discover(self, s):
-        hidden_message = self.steg.discover(self.steg.filepath)
-        if hidden_message:
-            self.hidden_message.setText("HIDDEN MESSAGE:\n" + hidden_message)
+        password, ok = QInputDialog.getText(self, "QInputDialog.getText()",
+                                "Password:", QLineEdit.Normal)
+        if ok and password:
+            hidden_message = self.steg.discover(self.steg.filepath, password)
+            if hidden_message:
+                self.hidden_message.setText("HIDDEN MESSAGE:\n" + hidden_message)
+            else:
+                self.hidden_message.setText("NO HIDDEN MESSAGE FOUND")
         else:
-            self.hidden_message.setText("NO HIDDEN MESSAGE FOUND")
+            print("Failed to prompt password!")
         
     def enable_enscribe(self, s):
-        if self.input.text() != '' and self.image.pixmap:
+        if self.input.text() != '' and not self.image.pixmap().isNull():
             self.enscribe_button.setEnabled(True)
         else:
             self.enscribe_button.setEnabled(False)
 
     def enscribe(self, s):
-        enscribed_image_bytes_str = self.steg.enscribe(self.steg.filepath, self.input.text())
-        enscribed_image_bytes = QByteArray(enscribed_image_bytes_str)
-        QFileDialog.saveFileContent(enscribed_image_bytes, "MOD_" + self.steg.filepath.name)
+        password, ok = QInputDialog.getText(self, "QInputDialog.getText()",
+                                "Password:", QLineEdit.Normal)
+        if ok and password:
+            enscribed_image_bytes_str = self.steg.enscribe(self.steg.filepath, self.input.text(), password)
+            enscribed_image_bytes = QByteArray(enscribed_image_bytes_str)
+            QFileDialog.saveFileContent(enscribed_image_bytes, "MOD_" + self.steg.filepath.name)
+            self.input.setText("")
+        else:
+            print("Failed to prompt password!")
 
 
 app = QApplication([])
