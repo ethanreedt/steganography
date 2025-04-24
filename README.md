@@ -13,7 +13,7 @@ while the message itself is not encrypted (but rather scattered randomly).
 
 ![Diagram of a hidden message (with a hidden message inside!)](hidden_message.png)
 
-(_**Note**: The source code in `app.py` is hidden in this diagram!_)
+(_**Note**: The source code in `app.py` is hidden in this diagram! You can try it with password: `password`_)
 
 ## Use
 
