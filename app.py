@@ -242,12 +242,14 @@ class MainWindow(QMainWindow):
         self.image_container = QVBoxLayout()
         self.filename = QLabel("Filename...")
         self.image = QLabel()
-        self.hidden_message = QLabel()
-        self.hidden_message.setWordWrap(True)
+        self.hidden_message_label = QLabel()
+        self.hidden_message = QLineEdit()
+        self.hidden_message.setEnabled(False)
 
         self.image_container.addStretch()
         self.image_container.addWidget(self.filename)
         self.image_container.addWidget(self.image)
+        self.image_container.addWidget(self.hidden_message_label)
         self.image_container.addWidget(self.hidden_message)
         self.image_container.addStretch()
 
@@ -277,7 +279,9 @@ class MainWindow(QMainWindow):
         self.discover_button.setEnabled(True)
         self.filename.setText(filepath.name)
         self.image.setPixmap(QPixmap(filepath).scaled(400, 400, aspectMode=Qt.AspectRatioMode.KeepAspectRatio))
+        self.hidden_message_label.setText("")
         self.hidden_message.setText("")
+        self.hidden_message.setEnabled(False)
 
     def discover(self, s):
         password, ok = QInputDialog.getText(self, "QInputDialog.getText()",
@@ -285,9 +289,11 @@ class MainWindow(QMainWindow):
         if ok and password:
             hidden_message = self.steg.discover(self.steg.filepath, password)
             if hidden_message:
-                self.hidden_message.setText("HIDDEN MESSAGE:\n" + hidden_message)
+                self.hidden_message_label.setText("HIDDEN MESSAGE:")
+                self.hidden_message.setEnabled(True)
+                self.hidden_message.setText(hidden_message)
             else:
-                self.hidden_message.setText("NO HIDDEN MESSAGE FOUND")
+                self.hidden_message_label.setText("NO HIDDEN MESSAGE FOUND")
         else:
             print("Failed to prompt password!")
         
