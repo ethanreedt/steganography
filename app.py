@@ -28,13 +28,12 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 class Steganographer:
     def __init__(self):
-        self.MAX_SIZE_BITS = 16
+        self.MAX_SIZE_BITS = 32
         self.MAX_SEED_BITS = 16
         self.IV_BYTES = 16
         self.SALT_BYTES = 16
         self.BLOCK_SIZE_BITS = 128
         self.filepath : Path = None
-        pass
 
     def set_file(self, filepath : Path):
         self.filepath = filepath
@@ -131,7 +130,7 @@ class Steganographer:
             width, _ = image.size
             x = (idx // total_bands) % width
             y = (idx // total_bands) // width
-            band = idx % 3
+            band = idx % total_bands
 
             pixel = image.getpixel((x, y))
             pixels[x, y] = tuple([x if i != band else hide(x, b) for i,x in enumerate(pixel)])
@@ -145,11 +144,10 @@ class Steganographer:
         # write body
         random.seed(seed)
 
-        rand_locs = []
+        rand_locs = random.sample(range(0, total_size - len(enc_metadata_ba) - 1), k=len(secret_ba))
 
-        for b in secret_ba:
-            loc = random.randrange(0, total_size - len(enc_metadata_ba) - 1)
-            rand_locs.append(loc)
+        for i, loc in enumerate(rand_locs):
+            b = secret_ba[i]
             write_to_loc(image, pixels, loc, b)
 
         # save the file
@@ -168,7 +166,7 @@ class Steganographer:
             width, _ = image.size
             x = (idx // total_bands) % width
             y = (idx // total_bands) // width
-            band = idx % 3
+            band = idx % total_bands
 
             return image.getpixel((x, y))[band] & 1
 
@@ -195,12 +193,10 @@ class Steganographer:
         # read body
         random.seed(seed)
 
-        rand_locs = []
+        rand_locs = random.sample(range(0, total_size - len(enc_metadata_ba) - 1), k=size)
 
         payload_ba = bitarray(size)
-        for i in range(len(payload_ba)):
-            loc = random.randrange(0, total_size - len(metadata_ba) - 1)
-            rand_locs.append(loc)
+        for i, loc in enumerate(rand_locs):
             payload_ba[i] = read_from_loc(image, loc)
 
         try:
